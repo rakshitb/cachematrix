@@ -1,0 +1,173 @@
+# Importing Libraries
+import pandas as pd
+import numpy as np
+import datetime
+from dfply import *
+import glob as glob
+import re
+pd.options.display.float_format = '{:.0f}'.format
+
+# Reading All required tables Table
+
+## Employee Table
+eehdr=pd.read_csv("L:\To Rakshit\....csv",
+                  encoding='latin-1',low_memory=False)                          
+
+## Dependant Table
+gppedp=pd.read_csv("L:\To Rakshit\....csv",
+                   encoding='latin-1',low_memory=False,dtype={'PHNO':str,'CERTNO':str})
+
+###@@@@@@-------------------- Processing Table 1 ---------------@@@@@@###
+eehdr1=eehdr.copy()
+eehdr1['EEID']=eehdr1['EEID'].str.replace(r"\(.*\)","")      ## Removing brackets and text within from EEID column
+eehdr1['EETERM']=pd.to_datetime(eehdr1['EETERM'],format='%Y%m%d',infer_datetime_format=True,errors='coerce') ## Transforming termination date into datetime object
+today=datetime.datetime.today();sixty=today+datetime.timedelta(days=60) 
+eehdr1.EETERM=eehdr1['EETERM'].fillna(sixty)        ## replacing nan in eeterm date column with date 2months from today
+eehdr1=eehdr1.replace(np.nan,'',regex=True)         ## replace all other na with ''
+extemp=eehdr1>>mask(X.EETERM>today)              ## existing employees with termination date falling in next week and beyond
+extemp=extemp>>mutate(pc=X.PHNO.map(str)+X.CERTNO.map(str),ndg=X.EENAME.map(str)+X.EEDOB.map(str)+X.EESEX.map(str))        ## merging columns phno and certno into one
+extemp['pc']=extemp.pc.map(lambda x: re.sub('\W+','', x));extemp['ndg']=extemp.ndg.map(lambda x: re.sub('\W+','', x))
+
+# Removing duplicated records based on the new column pc (comb of policy no and certno)
+extemp['EEID']=extemp.EEID.map(lambda x: re.sub('\W+','', x))
+npol=extemp>>distinct(X.EEID)
+l=npol>>pull('EEID')
+extemp1=extemp.loc[extemp['EEID'].isin(l)]
+m=extemp1.drop_duplicates(['EENAME','EEID'])
+m1=m>>group_by(X.EEID)>>summarize(pc_distinct=n_distinct(X.pc))
+m1>>=mask(X.pc_distinct>1)
+m1=m1.reset_index(drop=True)
+l1=m1>>pull("EEID")
+
+# Filtering out the records that have same EEID but different EENAME in order to only account for indvidual policies and not companies and institutions
+singleid=extemp1[-extemp1["EEID"].isin(l1)]
+filt=singleid["EEID"]!="";singleid=singleid[filt]
+singleid>>=group_by(X.EEID)>>summarize(pc_d=n_distinct(X.pc))>>mask(X.pc_d>=1)>>select(X.EEID)
+singleid=singleid.reset_index()
+sinid=singleid>>pull("EEID")
+
+# Extracting the required columns i.e. HKID, ndg and pc from the singleid dataset
+tempdf=extemp.loc[extemp['EEID'].isin(sinid)]
+tempdf>>=select(X.EEID,X.ndg,X.pc)
+
+l2=tempdf>>pull("pc")
+####-------------------X---------------X----------------X----------X--------------X-------------####
+
+###@@@@@@----- Processing Table 2 & merging with table 1 ------@@@@@@###
+gppedp1=gppedp.copy()
+#gppedp1.PHNO=gppedp1.PHNO.astype(str).replace('\.0', '', regex=True)
+gppedp1>>=mutate(pc=X.PHNO.map(str)+X.CERTNO.map(str)) # merging the policy no and certno in dependant table
+gppedp1['pc']=gppedp1.pc.map(lambda x: re.sub('\W+','', x))
+gppedp2=gppedp1.loc[gppedp1['pc'].isin(l2)] # Filtering the dependant tavble based on pc from employee table
+gppedp2>>=select(X.pc,X.DEPNO)
+emdep=tempdf>>inner_join(gppedp2,by="pc")
+emdep>>=mutate(pcd=X.pc.map(str)+X.DEPNO.map(str))>>select(X.EEID,X.ndg,X.pcd)
+emdep['ndg']=emdep.ndg.map(lambda x: re.sub('\W+','', x))
+emdep['pcd']=emdep.pcd.map(lambda x: re.sub('\W+','', x))
+####-------------------X---------------X----------------X----------X--------------X-------------####
+
+## Reading & merging the cleaned individual claim files for historical years
+path =r'L:\To Rakshit\' # use your path
+allFiles = glob.glob(path + "/*.csv")
+frame = pd.DataFrame()
+list_ = []
+for file_ in allFiles:
+    df = pd.read_csv(file_,index_col=None, header=None,low_memory=False,encoding='latin1')
+    list_.append(df)
+frame = pd.concat(list_)
+header=frame.iloc[0]
+frame=frame[1:]
+frame=frame.rename(columns=header)
+codf=frame>>select(X.pcd,X.dgc,X.dgc1,X.dgc2,X.dgc3,X.dgc4)
+empclm=emdep>>inner_join(codf,by="pcd")
+
+## Reading hospital claim file
+hdf=pd.read_csv("L:\To Rakshit...csv",encoding='latin-1',
+                low_memory=False)
+hdf['pcd']=hdf['POLICY HOLDER NO.'].map(str)+hdf['CERTIFICATE NO.'].map(str)+hdf['DEPENDENT NO.'].map(str)
+hdf['pcd']=hdf.pcd.map(lambda x: re.sub('\W+','', x))
+hdf=hdf.rename(index=str,columns={'DIAGNOSIS CODE':'hdgc'})
+hdf1=hdf>>select(X.pcd,X.hdgc)
+
+## merging the hospital claims data with employee claim data
+emdata=empclm>>inner_join(hdf1,by="pcd")
+
+## checking for chronic and other diseases
+#### reading the icd_codes data
+icdc=pd.read_csv("L:\To Rakshit\From Winnie\member_historical_ICD\icd_codes.csv",
+                 encoding='latin-1',low_memory=False)
+icdc=icdc.replace(np.nan,'',regex=True)
+emdata=emdata.replace(np.nan,'',regex=True)
+emdata>>=mutate(chronic="")
+icd1=icdc>>pull("icd_code")
+icd2=icdc>>pull("icd_cde")
+emdata['chronic']=np.where((emdata['dgc'].isin(icd1))|(emdata['dgc'].isin(icd2))|(emdata['dgc1'].isin(icd1))|(emdata['dgc1'].isin(icd2))|(emdata['hdgc'].isin(icd1))|(emdata['hdgc'].isin(icd2)),1,0)
+
+## separating out the records with chronic=1 & chronic=0
+emp1=emdata>>mask(X.chronic==1)
+emp2=emdata>>mask(X.chronic==0)
+emp1=emp1.replace(r'\s+', np.nan, regex=True)
+emp2=emp2.replace(r'\s+', np.nan, regex=True)
+emp1=emp1[emp1.dgc.notnull()]
+emp2=emp2[emp2.dgc.notnull()]
+
+### for failsafe
+# Writing the processed data in hdfstore
+#"write"
+#with pd.HDFStore('test.h5',  mode='w') as store:
+#    store.append('df', emp1, data_columns= emp1.columns, format='table')
+    
+#with pd.HDFStore('test.h6',  mode='w') as store:
+#    store.append('df', emp2, data_columns= emp2.columns, format='table')    
+    
+#"read"
+with pd.HDFStore('test.h5',  mode='r') as newstore:
+    emp1 = newstore.select('df')
+
+with pd.HDFStore('test.h6',  mode='r') as newstore:
+    emp2 = newstore.select('df')
+
+emp11=emp1.groupby(['EEID','ndg','dgc']).size().reset_index(name='freq')
+emp11=emp11.groupby(['EEID','ndg']).agg(lambda x: x.tolist()).applymap(list).reset_index()
+emp12=emp1.groupby(['EEID','ndg','hdgc']).size().reset_index(name='freq')
+emp12=emp12.groupby(['EEID','ndg']).agg(lambda x: x.tolist()).applymap(list).reset_index()
+emp13=emp1.groupby(['EEID','ndg','dgc1']).size().reset_index(name='freq')
+emp13=emp13.groupby(['EEID','ndg']).agg(lambda x: x.tolist()).applymap(list).reset_index()
+
+emp21=emp2.groupby(['EEID','ndg','dgc']).size().reset_index(name='freq')
+emp21=emp21.groupby(['EEID','ndg']).agg(lambda x: x.tolist()).applymap(list).reset_index()
+emp22=emp2.groupby(['EEID','ndg','hdgc']).size().reset_index(name='freq')
+emp22=emp22.groupby(['EEID','ndg']).agg(lambda x: x.tolist()).applymap(list).reset_index()
+emp23=emp2.groupby(['EEID','ndg','dgc1']).size().reset_index(name='freq')
+emp23=emp23.groupby(['EEID','ndg']).agg(lambda x: x.tolist()).applymap(list).reset_index()
+
+## Renaming the columns for case and concatenating the columns
+emp12>>=rename(ndg1=X.ndg,freq1=X.freq)
+emp13>>=rename(ndg2=X.ndg,freq2=X.freq)
+empch=emp11>>left_join(emp12,by="EEID")>>left_join(emp13,by="EEID")>>select(X.EEID,X.ndg,
+                      X.dgc,X.hdgc,X.dgc1,X.freq,X.freq1,X.freq2)
+
+empchr=empch.assign(icd_c=empch.dgc.map(str)+','+empch.dgc1.map(str)+','+empch.hdgc.map(str),
+                    freq_c=empch.freq.map(str)+','+empch.freq1.map(str)+','+empch.freq2.map(str))
+empchr>>=select(X.EEID,X.ndg,X.icd_chronic,X.freq_chronic)
+
+## Renaming the columns for ncase and concatenating the columns
+emp22>>=rename(ndg1=X.ndg,freq1=X.freq)
+emp23>>=rename(ndg2=X.ndg,freq2=X.freq)
+empnch=emp21>>left_join(emp22,by="EEID")>>left_join(emp23,by="EEID")>>select(X.EEID,X.ndg,
+                      X.dgc,X.hdgc,X.dgc1,X.freq,X.freq1,X.freq2)
+
+empnchr=empnch.assign(icd_other=empnch.dgc.map(str)+','+empnch.dgc1.map(str)+','+empnch.hdgc.map(str),
+                    freq_other=empnch.freq.map(str)+','+empnch.freq1.map(str)+','+empnch.freq2.map(str))
+empnchr>>=select(X.EEID,X.ndg,X.icd_other,X.freq_other)>>rename(ndg1=X.ndg)
+
+## Joining chronic and non-chronic dataframes
+emp_hist=empchr>>left_join(empnchr,by="EEID")>>select(X.EEID,
+                          X.ndg,X.icd_chronic,X.freq_chronic,X.icd_other,X.freq_other)
+
+emp_hist = emp_hist.replace(np.nan, '', regex=True)
+emp_hist=emp_hist.drop_duplicates(keep='last')
+
+## writing the dataframe to csv
+emp_hist.to_csv("L:\To Rakshit\....csv",
+                float_format=str,index=False)
